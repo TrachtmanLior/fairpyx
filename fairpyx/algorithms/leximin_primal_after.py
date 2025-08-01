@@ -226,87 +226,82 @@ def primal_lp(feasible_sets, R, agents, p_star):
 
     return M_val, pi, xS
 
+from itertools import combinations, product
+from collections import Counter
+from functools import lru_cache
+
+@lru_cache(maxsize=None)
+def generate_agent_bundles(preference_tuple, capacity):
+    """
+    Generates all bundles for an agent:
+    - Agent can only receive multiple copies of ONE item
+    - Total quantity ≤ capacity
+    """
+    return [
+        (item,) * qty
+        for item in preference_tuple
+        for qty in range(1, capacity + 1)
+    ]
+
 def generate_feasible_sets(agents, items, demands, capacities, preferences):
     """
-    Generates all feasible deterministic allocations over all agents.
+    Efficient generator for all feasible deterministic allocations over agent subsets.
 
-    Each agent can get at most one of their preferred items (or nothing),
-    and item capacities cannot be exceeded.
+    Each agent can receive one item type only (multiple copies),
+    and items must be exclusively assigned (each item to at most one agent).
 
-    Arguments:
-        agents (list[int]): Agent IDs.
-        items (list[str]): Available item names.
-        demands (dict[int, int]): Agent demands.
-        capacities (dict[str, int]): Item capacities.
-        preferences (dict[int, set[str]]): Items each agent values.
-
-    Returns:
-        list of (frozenset, list of (agent, item)):
-            Feasible allocations as (agents_in_S, allocation_list).
-
-    Doctest:
-    >>> agents = [1, 2]
-    >>> items = ['a', 'b']
-    >>> demands = {1: 1, 2: 1}
-    >>> capacities = {'a': 1, 'b': 1}
-    >>> preferences = {1: {'a'}, 2: {'b'}}
-    >>> result = generate_feasible_sets(agents, items, demands, capacities, preferences)
-    >>> any(sorted(alloc) == [(1, 'a'), (2, 'b')] for _, alloc in result)
-    True
+    Yields:
+        (frozenset, list of (agent, item)) for each valid allocation
     """
-    logger.info("Enumerating all feasible allocations over all agents")
+    logger.info("Enumerating all feasible allocations")
 
-    from itertools import chain, combinations, product
+    agent_list = list(agents)
+    n = len(agent_list)
 
-    # Powerset helper: generates all subsets of agents
-    def powerset(iterable):
-        s = list(iterable)
-        return chain.from_iterable(combinations(s, r) for r in range(1, len(s) + 1))
+    for r in range(1, n + 1):
+        for agent_subset in combinations(agent_list, r):
+            agent_bundle_options = []
+            skip_subset = False
 
-    # Generates all bundles of one item type up to agent capacity
-    def generate_agent_bundles(preferences, agent_capacity):
-        if not preferences or agent_capacity <= 0:
-            return [()]
-        bundles = [()]
-        for item in preferences:
-            for qty in range(1, agent_capacity + 1):
-                bundles.append((item,) * qty)
-        return bundles
+            for agent in agent_subset:
+                prefs = tuple(sorted(preferences[agent]))
+                bundles = generate_agent_bundles(prefs, demands[agent])
+                if not bundles:
+                    skip_subset = True
+                    break
+                agent_bundle_options.append(bundles)
 
-    feasible_allocations = []
-    logger.info("Enumerating all feasible allocations over all agent subsets")
+            if skip_subset:
+                continue
 
-    # Go over all non-empty subsets of agents
-    for agent_subset in powerset(agents):
-        agent_bundle_options = {}
-        for agent in agent_subset:
-            bundles = generate_agent_bundles(preferences[agent], demands[agent])
-            agent_bundle_options[agent] = bundles
-            logger.debug(f"Agent {agent} has {len(bundles)} bundle options")
+            for joint in product(*agent_bundle_options):
+                item_total = Counter()
+                used_items = set()
+                allocation = []
 
-        all_joint_allocations = product(*(agent_bundle_options[agent] for agent in agent_subset))
+                valid = True
+                for agent, bundle in zip(agent_subset, joint):
+                    if not bundle:
+                        continue
 
-        for joint in all_joint_allocations:
-            item_count = {item: 0 for item in items}
-            item_to_agents = {item: set() for item in items}
-            allocation_list = []
+                    item = bundle[0]  # Since bundle is like ('a', 'a')
+                    if item in used_items:
+                        valid = False
+                        break
+                    if len(set(bundle)) > 1:
+                        valid = False
+                        break
 
-            for idx, agent in enumerate(agent_subset):
-                bundle = joint[idx]
-                for item in bundle:
-                    item_count[item] += 1
-                    item_to_agents[item].add(agent)
-                    allocation_list.append((agent, item))
+                    item_total[item] += len(bundle)
+                    if item_total[item] > capacities[item]:
+                        valid = False
+                        break
 
-            # Valid if:
-            # - item capacity is not exceeded
-            # - each item used by at most one agent
-            if all(item_count[item] <= capacities[item] for item in items) and \
-                    all(len(item_to_agents[item]) <= 1 for item in items):
-                feasible_allocations.append((frozenset(agent_subset), allocation_list))
-                logger.debug(f"Feasible allocation found: {allocation_list}")
+                    used_items.add(item)
+                    allocation.extend((agent, item) for _ in bundle)
 
-    return feasible_allocations
+                if valid:
+                    yield (frozenset(agent_subset), allocation)
 
 
 
@@ -429,7 +424,7 @@ def leximin_primal(alloc: AllocationBuilder) -> None:
     logger.info("=== Solving FeasibilityILP ===")
 
     # === Line 1-2: Generate feasible (S, AS) pairs using ILP with pruning ===
-    feasible_sets = generate_feasible_sets(agents, items, demands, capacities, preferences)
+    feasible_sets = list(generate_feasible_sets(agents, items, demands, capacities, preferences))
     logger.info(f"Total feasible allocations: {len(feasible_sets)}")
 
     # === Line 3: R ← N ===
